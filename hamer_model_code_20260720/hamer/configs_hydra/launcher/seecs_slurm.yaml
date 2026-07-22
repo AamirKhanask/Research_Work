@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - override /hydra/launcher: submitit_slurm
+
+hydra:
+  launcher:
+    timeout_min: 1440  # 24 hours (adjust based on cluster limits)
+    nodes: 1
+    tasks_per_node: 1
+    gpus_per_task: 1
+    cpus_per_task: 8
+    mem_gb: 32
+    partition: gpu
+    qos: normal
+    account: seecs
+    name: hamer_ho3d
+    setup:
+      - export CUDA_VISIBLE_DEVICES=0

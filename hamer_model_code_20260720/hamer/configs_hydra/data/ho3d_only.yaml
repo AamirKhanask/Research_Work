@@ -1,0 +1,8 @@
+# @package _global_
+
+DATASETS:
+  TRAIN: 
+    HO3D-TRAIN:
+      WEIGHT: 1.0
+  VAL: {}
+  MOCAP: FREIHAND-MOCAP  # Use existing mocap data
