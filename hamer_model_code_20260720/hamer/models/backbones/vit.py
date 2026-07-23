@@ -13,7 +13,7 @@ from hamer.models.tokenmixers.ss2d_mlgru import SS2D_MLGRU_Attn
 
 def monitor(var_name, var):  # monitor("Before_Attention vit 163", x)
     # """Prints details about a variable for debugging."""
-    # print(f"\n🔍 {var_name} Info:")
+    # print(f"\n\U0001f50d {var_name} Info:")
     # print(f"Type: {type(var)}")
     # if isinstance(var, torch.Tensor):
     #     print(f"Value: {var}")
@@ -30,9 +30,15 @@ def vit(cfg):
     # Read token_mixer_type from config, default to "attention" for backward compatibility
     token_mixer_type = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_TYPE', 'attention')
     token_mixer_heads = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_HEADS', 16)
-    
-    print(f"🔧 Initializing ViT with token_mixer_type={token_mixer_type}, heads={token_mixer_heads}")
-    
+    # NEW: explicit config-driven control of SS2D_MLGRU_Attn's proj_in/proj_out.
+    # Defaults preserve prior behavior (proj_in=False, proj_out=True) so existing
+    # YAMLs that don't set these keys are unaffected.
+    token_mixer_proj_in = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_PROJ_IN', False)
+    token_mixer_proj_out = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_PROJ_OUT', True)
+
+    print(f"🔧 Initializing ViT with token_mixer_type={token_mixer_type}, heads={token_mixer_heads}, "
+          f"proj_in={token_mixer_proj_in}, proj_out={token_mixer_proj_out}")
+
     return ViT(
         img_size=(256, 192),
         patch_size=16,
@@ -46,6 +52,8 @@ def vit(cfg):
         drop_path_rate=0.55,
         token_mixer_type=token_mixer_type,
         token_mixer_heads=token_mixer_heads,
+        token_mixer_proj_in=token_mixer_proj_in,
+        token_mixer_proj_out=token_mixer_proj_out,
     )
 
 
@@ -148,11 +156,12 @@ class Block(nn.Module):
                  drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU,
                  norm_layer=nn.LayerNorm, attn_head_dim=None,
                  token_mixer_type="attention", token_mixer_heads=None,
-                 layer_idx=0):  # ← ADDED layer_idx
+                 layer_idx=0,
+                 token_mixer_proj_in=False, token_mixer_proj_out=True):  # NEW
         super().__init__()
         self.norm1 = norm_layer(dim)
         self._uses_hw = False  # whether attn module needs (H,W)
-        self.layer_idx = layer_idx  # ← ADDED
+        self.layer_idx = layer_idx
 
         if token_mixer_type == "attention":
             self.attn = Attention(
@@ -164,7 +173,9 @@ class Block(nn.Module):
             from ..tokenmixers.ss2d_mlgru import SS2D_MLGRU_Attn
             self.attn = SS2D_MLGRU_Attn(
                 dim=dim, num_heads=token_mixer_heads or num_heads, proj_drop=drop,
-                layer_idx=layer_idx  # ← PASS layer_idx to SS2D_MLGRU_Attn
+                layer_idx=layer_idx,
+                proj_in=token_mixer_proj_in,    # NEW: now config-driven, no longer hardcoded
+                proj_out=token_mixer_proj_out,  # NEW: now config-driven, no longer hardcoded
             )
             self._uses_hw = True
 
@@ -174,7 +185,7 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,
                        act_layer=act_layer, drop=drop)
 
-    def forward(self, x, Hp, Wp, lower_bound=None):  # ← ADDED lower_bound parameter
+    def forward(self, x, Hp, Wp, lower_bound=None):
         if self._uses_hw:
             monitor("Before_attn block vit 171", x)
             x = x + self.drop_path(self.attn(self.norm1(x), hw=(Hp, Wp), lower_bound=lower_bound))
@@ -259,7 +270,8 @@ class ViT(nn.Module):
                  attn_drop_rate=0., drop_path_rate=0., hybrid_backbone=None, norm_layer=None,
                  use_checkpoint=False, frozen_stages=-1, ratio=1, last_norm=True,
                  patch_padding='pad', freeze_attn=False, freeze_ffn=False,
-                 token_mixer_type: str = "attention", token_mixer_heads: int = None):
+                 token_mixer_type: str = "attention", token_mixer_heads: int = None,
+                 token_mixer_proj_in: bool = False, token_mixer_proj_out: bool = True):  # NEW
         super().__init__()
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         self.num_classes = num_classes
@@ -272,6 +284,8 @@ class ViT(nn.Module):
         self.depth = depth
         self.token_mixer_type = token_mixer_type
         self.token_mixer_heads = token_mixer_heads or num_heads
+        self.token_mixer_proj_in = token_mixer_proj_in
+        self.token_mixer_proj_out = token_mixer_proj_out
 
         if hybrid_backbone is not None:
             self.patch_embed = HybridEmbed(
@@ -311,7 +325,9 @@ class ViT(nn.Module):
                 norm_layer=norm_layer,
                 token_mixer_type=self.token_mixer_type,
                 token_mixer_heads=self.token_mixer_heads,
-                layer_idx=i,  # ← PASS layer index to each block
+                layer_idx=i,
+                token_mixer_proj_in=self.token_mixer_proj_in,    # NEW
+                token_mixer_proj_out=self.token_mixer_proj_out,  # NEW
             )
             for i in range(depth)
         ])
