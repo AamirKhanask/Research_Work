@@ -9,7 +9,7 @@ from .bitlinear_from_parent import BitLinear  # use if you later want proj_in/pr
 
 def monitor(var_name, var):  # monitor("Before_Attention vit 163", x)
     # """Prints details about a variable for debugging."""
-    # print(f"\n🔍 {var_name} Info:")
+    # print(f"\n\U0001f50d {var_name} Info:")
     # print(f"Type: {type(var)}")
     # if isinstance(var, torch.Tensor):
     #     print(f"Value: {var}")
@@ -21,7 +21,7 @@ def monitor(var_name, var):  # monitor("Before_Attention vit 163", x)
     # else:
     #     print(f"Value: {var}")
     pass
-    
+
 def _to_grid(x: torch.Tensor, H: int, W: int) -> torch.Tensor:
     # x: [B, L, D] -> [B, D, H, W]
     B, L, D = x.shape
@@ -45,7 +45,10 @@ def _cross_scan_4(x_bchw: torch.Tensor) -> torch.Tensor:
     return torch.stack([seqs, seqs_col, seqs_rev, seqs_col_rev], dim=1).transpose(2, 3).contiguous()
 
 def _cross_merge_4(y_b4lcd: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    # [B, 4, L, C] -> average the 4 directions back to [B, C, H, W]
+    # [B, 4, L, C] -> SUM the 4 directions back to [B, C, H, W]
+    # NOTE: matches VMamba reference cross_merge_fwd / CrossMergeF, which uses
+    # ys.sum(1) with NO division by the number of scan directions. Do not
+    # reintroduce averaging here without a deliberate reason.
     B, K, L, C = y_b4lcd.shape
     assert K == 4
     y_b4cl = y_b4lcd.transpose(2, 3)  # [B, 4, C, L]
@@ -59,24 +62,46 @@ def _cross_merge_4(y_b4lcd: torch.Tensor, H: int, W: int) -> torch.Tensor:
     d2 = dir2.view(B, C, H, W)
     d1 = dir1.view(B, C, W, H).transpose(2, 3).contiguous()
     d3 = dir3.view(B, C, W, H).transpose(2, 3).contiguous()
-    return (d0 + d1 + d2 + d3) / 4.0 ###########
+    return d0 + d1 + d2 + d3  # SUM, not average (VMamba-faithful)
 
 class SS2D_MLGRU_Attn(nn.Module):
     """
     Drop-in replacement for ViT's Attention:
     forward(x: [B, N, D]) -> [B, N, D], using SS2D + MLGRU1D (4 directions).
+
+    proj_in / proj_out:
+        Optional BitLinear projections wrapping the MLGRU core.
+        proj_in  (default False): applied to x right after SiLU, before
+                 gridifying/cross-scanning. Off by default.
+        proj_out (default True):  applied to the merged output right before
+                 the final GELU + dropout. On by default (acts as the
+                 mixer's output projection, analogous to attention's `proj`).
+        These are class-level defaults and are NOT currently exposed through
+        Block/ViT/vit(cfg) or any YAML config -- there is no config path that
+        can override them, so every token_mixer_type='ss2d_mlgru' run always
+        uses proj_in=False, proj_out=True regardless of experiment YAML.
     """
     def __init__(self, dim: int, num_heads: int, attn_drop: float = 0.0, proj_drop: float = 0.0,
-                 proj_in: bool = False, proj_out: bool = True, use_short_conv: bool = False, 
-                 layer_idx: int = 0):  # ← ADD layer_idx parameter
+                 proj_in: bool = False, proj_out: bool = True, use_short_conv: bool = False,
+                 layer_idx: int = 0, dwconv_kernel: int = 3):  # dwconv_kernel: NEW
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        self.layer_idx = layer_idx  # ← ADD THIS
+        self.layer_idx = layer_idx
         self.proj_in = BitLinear(dim, dim, bias=False) if proj_in else nn.Identity()
         self.act_in = nn.SiLU()
-        self.mlgru = MLGRU1D(hidden_size=dim, num_heads=num_heads, 
-                             use_short_conv=use_short_conv, layer_idx=layer_idx)  # ← Pass layer_idx
+
+        # VMamba-style local 2D prior: depthwise conv applied to the gridified
+        # tensor BEFORE cross-scanning, matching SS2Dv2's conv2d (groups=d_inner,
+        # placed right after in_proj/act and before the scan). Cheap: dwconv_kernel^2 * dim
+        # weights total, negligible vs. the BitLinear projections.
+        self.dwconv = nn.Conv2d(
+            in_channels=dim, out_channels=dim, kernel_size=dwconv_kernel,
+            padding=(dwconv_kernel - 1) // 2, groups=dim, bias=False,
+        )
+
+        self.mlgru = MLGRU1D(hidden_size=dim, num_heads=num_heads,
+                             use_short_conv=use_short_conv, layer_idx=layer_idx)
         self.act_out = nn.GELU()
         self.proj_out = BitLinear(dim, dim, bias=False) if proj_out else nn.Identity()
         self.drop = nn.Dropout(proj_drop)
@@ -87,16 +112,17 @@ class SS2D_MLGRU_Attn(nn.Module):
         return hw, N // hw
 
     def forward(self, x: torch.Tensor, hw: Tuple[int, int] = None,
-                lower_bound: Optional[torch.Tensor] = None) -> torch.Tensor:  # ← ADD lower_bound parameter
+                lower_bound: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: [B, N, D]
         B, N, D = x.shape
-        
+
         H, W = self._infer_hw(N) if hw is None else hw
         assert H * W == N, f"L != H*W: got N={N}, H={H}, W={W}"
 
         # pre-proj + SiLU
         x = self.act_in(self.proj_in(x))
         grid = _to_grid(x, H, W)
+        grid = self.dwconv(grid)  # NEW: local 2D prior before cross-scan (VMamba-style)
         scans = _cross_scan_4(grid)
         scans = scans.reshape(B * 4, N, D)
 
@@ -105,7 +131,7 @@ class SS2D_MLGRU_Attn(nn.Module):
         # For layers > 0, we can use a learnable parameter or fixed value
         # The original uses: lower_bound = lower_bounds[i].softmax(0).cumsum(0) - lower_bounds[0]
         # For simplicity, we'll use a learnable parameter per layer
-        
+
         # If lower_bound not provided, compute a default based on layer depth
         if lower_bound is None and self.layer_idx > 0:
             # Default: bound increases with depth (0.1 for deep layers)
@@ -119,7 +145,7 @@ class SS2D_MLGRU_Attn(nn.Module):
         y = y.view(B, 4, N, D)
         y_grid = _cross_merge_4(y, H, W)
         y = _to_seq(y_grid)
-        
+
         y = self.act_out(y)
         y = self.drop(self.proj_out(y))
         return y
