@@ -30,10 +30,9 @@ def vit(cfg):
     # Read token_mixer_type from config, default to "attention" for backward compatibility
     token_mixer_type = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_TYPE', 'attention')
     token_mixer_heads = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_HEADS', 16)
-    # NEW: explicit config-driven control of SS2D_MLGRU_Attn's proj_in/proj_out.
-    # Defaults preserve prior behavior (proj_in=False, proj_out=True) so existing
-    # YAMLs that don't set these keys are unaffected.
-    token_mixer_proj_in = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_PROJ_IN', False)
+    # Explicit config-driven control of SS2D_MLGRU_Attn's proj_in/proj_out.
+    # Both now default to True (previously proj_in defaulted to False).
+    token_mixer_proj_in = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_PROJ_IN', True)
     token_mixer_proj_out = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_PROJ_OUT', True)
 
     print(f"🔧 Initializing ViT with token_mixer_type={token_mixer_type}, heads={token_mixer_heads}, "
@@ -157,7 +156,7 @@ class Block(nn.Module):
                  norm_layer=nn.LayerNorm, attn_head_dim=None,
                  token_mixer_type="attention", token_mixer_heads=None,
                  layer_idx=0,
-                 token_mixer_proj_in=False, token_mixer_proj_out=True):  # NEW
+                 token_mixer_proj_in=True, token_mixer_proj_out=True):  # both default True now
         super().__init__()
         self.norm1 = norm_layer(dim)
         self._uses_hw = False  # whether attn module needs (H,W)
@@ -174,8 +173,8 @@ class Block(nn.Module):
             self.attn = SS2D_MLGRU_Attn(
                 dim=dim, num_heads=token_mixer_heads or num_heads, proj_drop=drop,
                 layer_idx=layer_idx,
-                proj_in=token_mixer_proj_in,    # NEW: now config-driven, no longer hardcoded
-                proj_out=token_mixer_proj_out,  # NEW: now config-driven, no longer hardcoded
+                proj_in=token_mixer_proj_in,    # config-driven, defaults True
+                proj_out=token_mixer_proj_out,  # config-driven, defaults True
             )
             self._uses_hw = True
 
@@ -271,7 +270,7 @@ class ViT(nn.Module):
                  use_checkpoint=False, frozen_stages=-1, ratio=1, last_norm=True,
                  patch_padding='pad', freeze_attn=False, freeze_ffn=False,
                  token_mixer_type: str = "attention", token_mixer_heads: int = None,
-                 token_mixer_proj_in: bool = False, token_mixer_proj_out: bool = True):  # NEW
+                 token_mixer_proj_in: bool = True, token_mixer_proj_out: bool = True):  # both default True
         super().__init__()
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         self.num_classes = num_classes
@@ -326,8 +325,8 @@ class ViT(nn.Module):
                 token_mixer_type=self.token_mixer_type,
                 token_mixer_heads=self.token_mixer_heads,
                 layer_idx=i,
-                token_mixer_proj_in=self.token_mixer_proj_in,    # NEW
-                token_mixer_proj_out=self.token_mixer_proj_out,  # NEW
+                token_mixer_proj_in=self.token_mixer_proj_in,
+                token_mixer_proj_out=self.token_mixer_proj_out,
             )
             for i in range(depth)
         ])
