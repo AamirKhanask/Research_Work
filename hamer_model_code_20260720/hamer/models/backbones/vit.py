@@ -10,6 +10,8 @@ from timm.models.layers import drop_path, to_2tuple, trunc_normal_
 
 # SS2D + MLGRU token mixer (drop-in): forward([B,N,D], hw=(H,W)) -> [B,N,D]
 from hamer.models.tokenmixers.ss2d_mlgru import SS2D_MLGRU_Attn
+# Fused BitLinear (RMSNorm + quant + linear), used for the optional BitLinear MLP variant
+from hamer.models.tokenmixers._vendor_mmfree.ops.fusedbitnet import FusedBitLinear
 
 def monitor(var_name, var):  # monitor("Before_Attention vit 163", x)
     # """Prints details about a variable for debugging."""
@@ -31,12 +33,17 @@ def vit(cfg):
     token_mixer_type = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_TYPE', 'attention')
     token_mixer_heads = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_HEADS', 16)
     # Explicit config-driven control of SS2D_MLGRU_Attn's proj_in/proj_out.
-    # Both now default to True (previously proj_in defaulted to False).
+    # Both default to True.
     token_mixer_proj_in = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_PROJ_IN', True)
     token_mixer_proj_out = cfg.MODEL.BACKBONE.get('TOKEN_MIXER_PROJ_OUT', True)
+    # NEW: MLP_TYPE is independent of TOKEN_MIXER_TYPE. "dense" (default) keeps the
+    # original nn.Linear-based Mlp; "bitlinear" swaps fc1/fc2 for FusedBitLinear while
+    # leaving Attention (qkv/proj) as real nn.Linear matmuls. This supports the
+    # "original QKV attention + BitLinear-everywhere-else (MLP)" baseline experiment.
+    mlp_type = cfg.MODEL.BACKBONE.get('MLP_TYPE', 'dense')
 
     print(f"🔧 Initializing ViT with token_mixer_type={token_mixer_type}, heads={token_mixer_heads}, "
-          f"proj_in={token_mixer_proj_in}, proj_out={token_mixer_proj_out}")
+          f"proj_in={token_mixer_proj_in}, proj_out={token_mixer_proj_out}, mlp_type={mlp_type}")
 
     return ViT(
         img_size=(256, 192),
@@ -53,6 +60,7 @@ def vit(cfg):
         token_mixer_heads=token_mixer_heads,
         token_mixer_proj_in=token_mixer_proj_in,
         token_mixer_proj_out=token_mixer_proj_out,
+        mlp_type=mlp_type,
     )
 
 
@@ -97,6 +105,7 @@ class DropPath(nn.Module):
 
 
 class Mlp(nn.Module):
+    """Original dense MLP: fc1/fc2 as real nn.Linear matmuls."""
     def __init__(self, in_features, hidden_features=None, out_features=None,
                  act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -115,7 +124,33 @@ class Mlp(nn.Module):
         return x
 
 
+class MlpBitLinear(nn.Module):
+    """
+    BitLinear-MLP variant for the 'original QKV attention + BitLinear-everywhere-else'
+    baseline: fc1/fc2 replaced with FusedBitLinear (RMSNorm + ternary weight quant +
+    8-bit activation quant + fused Triton linear), following the MatMul-Free LM paper's
+    gate_proj/down_proj pattern. Attention itself is untouched by this class.
+    """
+    def __init__(self, in_features, hidden_features=None, out_features=None,
+                 act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = FusedBitLinear(in_features, hidden_features, bias=False)
+        self.act = act_layer()
+        self.fc2 = FusedBitLinear(hidden_features, out_features, bias=False)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
 class Attention(nn.Module):
+    """Unmodified original self-attention: qkv/proj remain real nn.Linear matmuls."""
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
                  attn_drop=0., proj_drop=0., attn_head_dim=None):
         super().__init__()
@@ -156,7 +191,8 @@ class Block(nn.Module):
                  norm_layer=nn.LayerNorm, attn_head_dim=None,
                  token_mixer_type="attention", token_mixer_heads=None,
                  layer_idx=0,
-                 token_mixer_proj_in=True, token_mixer_proj_out=True):  # both default True now
+                 token_mixer_proj_in=True, token_mixer_proj_out=True,
+                 mlp_type="dense"):  # NEW: independent of token_mixer_type
         super().__init__()
         self.norm1 = norm_layer(dim)
         self._uses_hw = False  # whether attn module needs (H,W)
@@ -173,16 +209,20 @@ class Block(nn.Module):
             self.attn = SS2D_MLGRU_Attn(
                 dim=dim, num_heads=token_mixer_heads or num_heads, proj_drop=drop,
                 layer_idx=layer_idx,
-                proj_in=token_mixer_proj_in,    # config-driven, defaults True
-                proj_out=token_mixer_proj_out,  # config-driven, defaults True
+                proj_in=token_mixer_proj_in,
+                proj_out=token_mixer_proj_out,
             )
             self._uses_hw = True
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,
-                       act_layer=act_layer, drop=drop)
+        if mlp_type == "bitlinear":
+            self.mlp = MlpBitLinear(in_features=dim, hidden_features=mlp_hidden_dim,
+                                    act_layer=act_layer, drop=drop)
+        else:
+            self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,
+                           act_layer=act_layer, drop=drop)
 
     def forward(self, x, Hp, Wp, lower_bound=None):
         if self._uses_hw:
@@ -270,7 +310,8 @@ class ViT(nn.Module):
                  use_checkpoint=False, frozen_stages=-1, ratio=1, last_norm=True,
                  patch_padding='pad', freeze_attn=False, freeze_ffn=False,
                  token_mixer_type: str = "attention", token_mixer_heads: int = None,
-                 token_mixer_proj_in: bool = True, token_mixer_proj_out: bool = True):  # both default True
+                 token_mixer_proj_in: bool = True, token_mixer_proj_out: bool = True,
+                 mlp_type: str = "dense"):  # NEW
         super().__init__()
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         self.num_classes = num_classes
@@ -285,6 +326,7 @@ class ViT(nn.Module):
         self.token_mixer_heads = token_mixer_heads or num_heads
         self.token_mixer_proj_in = token_mixer_proj_in
         self.token_mixer_proj_out = token_mixer_proj_out
+        self.mlp_type = mlp_type
 
         if hybrid_backbone is not None:
             self.patch_embed = HybridEmbed(
@@ -327,6 +369,7 @@ class ViT(nn.Module):
                 layer_idx=i,
                 token_mixer_proj_in=self.token_mixer_proj_in,
                 token_mixer_proj_out=self.token_mixer_proj_out,
+                mlp_type=self.mlp_type,
             )
             for i in range(depth)
         ])
