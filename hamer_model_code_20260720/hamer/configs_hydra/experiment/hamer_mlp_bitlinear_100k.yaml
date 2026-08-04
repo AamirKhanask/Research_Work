@@ -1,0 +1,71 @@
+# @package _global_
+
+defaults:
+  - default.yaml
+
+# ============================================================
+# BASELINE EXPERIMENT: original QKV attention + BitLinear MLP
+# ============================================================
+# Isolates "MatMul-free dense layers (channel mixer)" from
+# "MatMul-free attention (token mixer)". Attention.qkv/proj stay
+# as real nn.Linear (identical to hamer_original_100k.yaml).
+# Only the MLP (fc1/fc2) is swapped for FusedBitLinear, following
+# the MatMul-Free LM paper's gate_proj/down_proj pattern.
+#
+# All GENERAL / TRAIN / LOSS_WEIGHTS values below are copied
+# verbatim from hamer_original_100k.yaml so the only difference
+# vs. that run is MODEL.BACKBONE.MLP_TYPE. Do not change
+# TOTAL_STEPS/CHECKPOINT_STEPS/etc. here without also changing
+# them in hamer_original_100k.yaml, or the comparison is no
+# longer fair.
+# ============================================================
+
+GENERAL:
+  TOTAL_STEPS: 20000
+  LOG_STEPS: 100
+  VAL_STEPS: 2000
+  CHECKPOINT_STEPS: 50000
+  CHECKPOINT_SAVE_TOP_K: 1
+  NUM_WORKERS: 4
+  PREFETCH_FACTOR: 2
+
+TRAIN:
+  LR: 1e-5                    # same as hamer_original_100k / mmfree training
+  WEIGHT_DECAY: 1e-4
+  BATCH_SIZE: 8
+  LOSS_REDUCTION: mean
+  NUM_TRAIN_SAMPLES: 2
+  NUM_TEST_SAMPLES: 64
+  POSE_2D_NOISE_RATIO: 0.01
+  SMPL_PARAM_NOISE_RATIO: 0.005
+  WARMUP_STEPS: 500
+  GRAD_CLIP_VAL: 0            # same as hamer_original_100k / mmfree
+
+MODEL:
+  IMAGE_SIZE: 256
+  IMAGE_MEAN: [0.485, 0.456, 0.406]
+  IMAGE_STD: [0.229, 0.224, 0.225]
+  BACKBONE:
+    TYPE: vit
+    # TOKEN_MIXER_TYPE not set = uses "attention" (real qkv/proj nn.Linear, untouched)
+    MLP_TYPE: "bitlinear"     # ONLY DIFFERENCE vs hamer_original_100k.yaml: fc1/fc2 -> FusedBitLinear
+  MANO_HEAD:
+    TYPE: transformer_decoder
+    IN_CHANNELS: 2048
+    TRANSFORMER_DECODER:
+      depth: 6
+      heads: 8
+      mlp_dim: 1024
+      dim_head: 64
+      dropout: 0.0
+      emb_dropout: 0.0
+      norm: layer
+      context_dim: 1280
+
+LOSS_WEIGHTS:
+  KEYPOINTS_3D: 0.05
+  KEYPOINTS_2D: 0.01
+  GLOBAL_ORIENT: 0.001
+  HAND_POSE: 0.001
+  BETAS: 0.0005
+  ADVERSARIAL: 0.0005
